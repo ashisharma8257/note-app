@@ -2,7 +2,7 @@ name: Notes
 options:
   bundleIdPrefix: com.ashish
   deploymentTarget:
-    iOS: "26.0"
+    iOS: "17.5"
 targets:
   Notes:
     type: application
@@ -14,6 +14,9 @@ targets:
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # White status bar text over the dark-blue tab strip on every screen.
+        UIViewControllerBasedStatusBarAppearance: false
+        UIStatusBarStyle: UIStatusBarStyleLightContent
         UISupportedInterfaceOrientations~ipad:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown

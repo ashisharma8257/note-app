@@ -2,7 +2,7 @@ import PencilKit
 
 /// Shape tools in the Pencil tool picker; the raw value is the picker item identifier.
 /// A finished shape is ordinary ink, so the eraser, lasso, undo and export treat it like handwriting.
-enum ShapeKind: String, CaseIterable {
+enum ShapeKind: String, CaseIterable, Codable {
     case line = "com.ashish.Notes.shape.line"
     case arrow = "com.ashish.Notes.shape.arrow"
     case rectangle = "com.ashish.Notes.shape.rectangle"
@@ -52,9 +52,12 @@ enum ShapeKind: String, CaseIterable {
 
     func strokes(from a: CGPoint, to b: CGPoint, color: UIColor, width: CGFloat) -> [PKStroke] {
         let ink = PKInk(.monoline, color: color)
+        // PencilKit renders a point of size s about 2s - 4 points wide (measured; sizes <= 2 draw nothing),
+        // so pick the size that renders `width`.
+        let size = width / 2 + 2
         return polylines(from: a, to: b, width: width).map { line in
             let points = densified(line).enumerated().map { i, p in
-                PKStrokePoint(location: p, timeOffset: Double(i) * 0.001, size: CGSize(width: width, height: width),
+                PKStrokePoint(location: p, timeOffset: Double(i) * 0.001, size: CGSize(width: size, height: size),
                               opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
             }
             return PKStroke(ink: ink, path: PKStrokePath(controlPoints: points, creationDate: Date()))
