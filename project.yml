@@ -1,0 +1,26 @@
+name: Notes
+options:
+  bundleIdPrefix: com.ashish
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Notes:
+    type: application
+    platform: iOS
+    sources: [Notes]
+    info:
+      path: Notes/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "2"
+        SWIFT_VERSION: "5.0"
+        DEVELOPMENT_TEAM: 7M5P7N8BH6

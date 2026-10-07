@@ -1,0 +1,6 @@
+*.xcodeproj/
+Notes/Info.plist
+xcuserdata/
+.DS_Store
+build/
+.claude/settings.local.json
