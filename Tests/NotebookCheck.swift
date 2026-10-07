@@ -1,7 +1,7 @@
 import PDFKit
 import PencilKit
 
-/// Page/ink bookkeeping check for Notebook: run with scripts/check.sh.
+/// Page/ink bookkeeping and shape geometry checks: run with scripts/check.sh.
 @main
 enum NotebookCheck {
     static func main() throws {
@@ -49,6 +49,18 @@ enum NotebookCheck {
 
         let exported = try nb.exportPDF()
         assert(PDFDocument(url: exported)?.pageCount == 2, "export has every page")
+        // Shapes: ink bounds match the dragged box (within stroke width + spline slack).
+        let a = CGPoint(x: 10, y: 10), b = CGPoint(x: 110, y: 60)
+        func bounds(_ shape: ShapeKind) -> CGRect { PKDrawing(strokes: shape.strokes(from: a, to: b, color: .black, width: 2)).bounds }
+        func near(_ r: CGRect, _ expected: CGRect) -> Bool {
+            [r.minX - expected.minX, r.minY - expected.minY, r.maxX - expected.maxX, r.maxY - expected.maxY].allSatisfy { abs($0) <= 3 }
+        }
+        let box = CGRect(x: 10, y: 10, width: 100, height: 50)
+        assert(near(bounds(.rectangle), box), "rectangle bounds: \(bounds(.rectangle))")
+        assert(near(bounds(.ellipse), box), "ellipse bounds: \(bounds(.ellipse))")
+        assert(ShapeKind.arrow.strokes(from: a, to: b, color: .black, width: 2).count == 2, "arrow is shaft + head")
+        assert(ShapeKind.rectangle.polylines(from: a, to: b, width: 2)[0].last == a, "rectangle closes")
+
         print("NotebookCheck passed")
     }
 }

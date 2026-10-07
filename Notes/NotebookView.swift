@@ -72,15 +72,21 @@ struct PDFCanvas: UIViewRepresentable {
 
     func updateUIView(_ view: PDFView, context: Context) {}
 
-    final class Coordinator: NSObject, PDFPageOverlayViewProvider, PKCanvasViewDelegate {
+    final class Coordinator: NSObject, PDFPageOverlayViewProvider, PKCanvasViewDelegate, PKToolPickerObserver, UIGestureRecognizerDelegate {
         let nb: Notebook
-        let picker = PKToolPicker()
+        let picker = PKToolPicker(toolItems: PKToolPicker.defaultToolItems + ShapeKind.allCases.map(\.toolItem))
         var canvases: [PDFPage: PKCanvasView] = [:]
+        private let preview = CAShapeLayer()
+        private var dragStart = CGPoint.zero
 
         init(nb: Notebook) {
             self.nb = nb
             super.init()
             picker.colorUserInterfaceStyle = .light
+            picker.addObserver(self)
+            preview.fillColor = nil
+            preview.lineCap = .round
+            preview.lineJoin = .round
         }
 
         func pdfView(_ view: PDFView, overlayViewFor page: PDFPage) -> UIView? {
@@ -89,10 +95,20 @@ struct PDFCanvas: UIViewRepresentable {
             canvas.isOpaque = false
             canvas.isScrollEnabled = false
             canvas.overrideUserInterfaceStyle = .light // pages are white; don't invert ink in dark mode
-            canvas.tool = picker.selectedTool
+            if let tool = picker.selectedToolItem.tool { canvas.tool = tool }
             if let i = nb.index(of: page) { canvas.drawing = nb.drawing(at: i) }
             canvas.delegate = self
             picker.addObserver(canvas)
+
+            let drag = UIPanGestureRecognizer(target: self, action: #selector(dragShape(_:)))
+            drag.name = "shape"
+            drag.maximumNumberOfTouches = 1
+            let touches: [UITouch.TouchType] = UIPencilInteraction.prefersPencilOnlyDrawing ? [.pencil] : [.pencil, .direct]
+            drag.allowedTouchTypes = touches.map { NSNumber(value: $0.rawValue) }
+            drag.delegate = self
+            canvas.addGestureRecognizer(drag)
+            applyShapeMode(to: canvas)
+
             canvases[page] = canvas
             return canvas
         }
@@ -112,5 +128,98 @@ struct PDFCanvas: UIViewRepresentable {
             guard let page = canvases.first(where: { $0.value === canvas })?.key, let i = nb.index(of: page) else { return }
             nb.setDrawing(canvas.drawing, at: i)
         }
+
+        // MARK: Shape tools
+
+        private var selectedShape: ShapeKind? { ShapeKind(rawValue: picker.selectedToolItem.identifier) }
+
+        func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
+            canvases.values.forEach(applyShapeMode)
+        }
+
+        /// With a shape tool selected, the canvas stops inking and the drag gesture draws the shape instead.
+        private func applyShapeMode(to canvas: PKCanvasView) {
+            let shaping = selectedShape != nil
+            canvas.drawingGestureRecognizer.isEnabled = !shaping
+            canvas.gestureRecognizers?.filter { $0.name == "shape" }.forEach { $0.isEnabled = shaping }
+        }
+
+        @objc private func dragShape(_ drag: UIPanGestureRecognizer) {
+            guard let canvas = drag.view as? PKCanvasView, let shape = selectedShape,
+                  let item = picker.selectedToolItem as? PKToolPickerCustomItem else { return }
+            let end = drag.location(in: canvas)
+            switch drag.state {
+            case .began:
+                let moved = drag.translation(in: canvas)
+                dragStart = CGPoint(x: end.x - moved.x, y: end.y - moved.y)
+                preview.strokeColor = item.color.cgColor
+                preview.lineWidth = item.width
+                canvas.layer.addSublayer(preview)
+                fallthrough
+            case .changed:
+                let path = UIBezierPath()
+                for line in shape.polylines(from: dragStart, to: end, width: item.width) {
+                    path.move(to: line[0])
+                    line.dropFirst().forEach(path.addLine(to:))
+                }
+                preview.path = path.cgPath
+            case .ended:
+                preview.removeFromSuperlayer()
+                guard hypot(end.x - dragStart.x, end.y - dragStart.y) > 2 else { return }
+                let strokes = shape.strokes(from: dragStart, to: end, color: item.color, width: item.width)
+                replaceDrawing(of: canvas, with: canvas.drawing.appending(PKDrawing(strokes: strokes)))
+            default:
+                preview.removeFromSuperlayer()
+            }
+        }
+
+        /// Sets the drawing with an undo step that restores the previous one (and redo via the same path).
+        private func replaceDrawing(of canvas: PKCanvasView, with drawing: PKDrawing) {
+            let previous = canvas.drawing
+            canvas.undoManager?.registerUndo(withTarget: canvas) { [weak self] canvas in
+                self?.replaceDrawing(of: canvas, with: previous)
+            }
+            canvas.drawing = drawing
+        }
+
+        /// The PDF's scroll view waits for a shape drag, so dragging a shape doesn't scroll the page.
+        func gestureRecognizer(_ gesture: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            gesture.name == "shape" && other.view is UIScrollView
+        }
+    }
+}
+
+extension ShapeKind {
+    var toolItem: PKToolPickerCustomItem {
+        var config = PKToolPickerCustomItem.Configuration(identifier: rawValue, name: name)
+        config.defaultWidth = 3
+        config.allowsColorSelection = true
+        config.widthVariants = Dictionary(uniqueKeysWithValues: [1.5, 3, 6].map { ($0, widthImage($0)) })
+        config.imageProvider = { [symbol] item in toolImage(symbol: symbol, color: item.color) }
+        return PKToolPickerCustomItem(configuration: config)
+    }
+}
+
+/// Tool picker art: a pale body with the shape symbol in the tool's color (picker wants 150pt tall).
+private func toolImage(symbol: String, color: UIColor) -> UIImage {
+    UIGraphicsImageRenderer(size: CGSize(width: 50, height: 150)).image { _ in
+        UIColor(white: 0.9, alpha: 1).setFill()
+        UIBezierPath(roundedRect: CGRect(x: 8, y: 20, width: 34, height: 130), cornerRadius: 10).fill()
+        let config = UIImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
+        if let image = UIImage(systemName: symbol, withConfiguration: config)?.withTintColor(color, renderingMode: .alwaysOriginal) {
+            image.draw(at: CGPoint(x: 25 - image.size.width / 2, y: 44 - image.size.height / 2))
+        }
+    }
+}
+
+private func widthImage(_ width: CGFloat) -> UIImage {
+    UIGraphicsImageRenderer(size: CGSize(width: 32, height: 32)).image { _ in
+        let path = UIBezierPath()
+        path.move(to: CGPoint(x: 5, y: 16))
+        path.addLine(to: CGPoint(x: 27, y: 16))
+        path.lineWidth = width
+        path.lineCapStyle = .round
+        UIColor.black.setStroke()
+        path.stroke()
     }
 }
