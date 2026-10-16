@@ -588,6 +588,20 @@ func convert(archive dir: URL, fallbackTitle: String, into parent: URL) throws -
     let ordered = pages.values.sorted {
         $0.sortKey == $1.sortKey ? $0.id < $1.id : $0.sortKey.utf8.lexicographicallyPrecedes($1.sortKey.utf8)
     }
+    // A GoodNotes text document (nothing but typed text, on one endless page) becomes a text document: its first line
+    // the title, the rest its text.
+    let inks = try ordered.map { try pageInk($0.id) }
+    if boards.isEmpty, !inks.isEmpty,
+       inks.allSatisfy({ $0.document != nil && $0.strokes.isEmpty && $0.images.isEmpty && $0.textBoxes.isEmpty }) {
+        let lines = inks.flatMap { $0.document! }
+        let title = lines.first?.trimmingCharacters(in: .whitespaces) ?? ""
+        let doc = try Store.createTextDocument(title: title.isEmpty ? report.title : title, in: parent)
+        try Data(lines.dropFirst().drop { $0.isEmpty }.joined(separator: "\n").utf8).write(to: Store.textFile(doc))
+        report.title = Store.title(of: doc)
+        _ = Store.cover(of: doc)
+        return (doc, report)
+    }
+
     var geometry: [String: (scale: CGFloat, height: CGFloat)] = [:] // page id -> GoodNotes units per point, height in points
     var paperUse: [String: Int] = [:] // one-page template attachment -> pages using it
     for page in ordered {
@@ -791,6 +805,11 @@ enum GoodNotesImport {
                 try fm.createDirectory(at: parent, withIntermediateDirectories: true)
                 let (notebook, converted) = try convert(archive: unpacked, fallbackTitle: name, into: parent)
                 var report = converted
+                if Store.isTextDocument(notebook) {
+                    let lines = (try String(contentsOf: Store.textFile(notebook), encoding: .utf8)).split(separator: "\n", omittingEmptySubsequences: false)
+                    print("\(relative.isEmpty ? "" : relative + "/")\(report.title): text document, \(lines.count) lines")
+                    continue
+                }
                 if let theirs = UIImage(contentsOfFile: unpacked.appending(path: "thumbnail.jpg").path),
                    let ours = Notebook(folder: notebook).thumbnail(at: 0, width: 400) {
                     report.similarity = similarity(ours, theirs)
