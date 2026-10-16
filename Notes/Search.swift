@@ -30,7 +30,7 @@ enum SearchIndex {
     /// Indexes notebooks that have no index yet, e.g. ones made before search existed.
     static func indexMissing(in root: URL) {
         queue.async {
-            for notebook in Store.allNotebooks(in: root) where !FileManager.default.fileExists(atPath: url(notebook).path) {
+            for notebook in Store.allNotebooks(in: root) where !Store.exists(url(notebook)) {
                 rebuild(notebook, pages: nil)
             }
         }
@@ -38,6 +38,10 @@ enum SearchIndex {
 
     /// Synchronous indexing, reading the notebook from disk.
     static func rebuild(_ notebook: URL, pages ids: Set<UUID>?) {
+        // Boards and text documents have no pages: search reads a text document's own text, and finds boards by title.
+        guard !Store.isBoard(notebook), !Store.isTextDocument(notebook) else { return }
+        // A notebook iCloud is still downloading would index as blank; its index comes with it, or after the download.
+        guard Store.requestDownloads(in: notebook).missing == 0 else { return }
         let nb = Notebook(folder: notebook)
         var index = ids == nil ? [:] : load(notebook)
         for (i, id) in nb.pages.enumerated() where ids?.contains(id) ?? true {
@@ -59,7 +63,8 @@ enum SearchIndex {
         return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
     }
 
-    /// Case- and accent-insensitive match on titles and page text of every notebook under `root`.
+    /// Case- and accent-insensitive match on titles, page text and text documents' text under `root`; a text
+    /// document's match counts as its page 1.
     static func search(_ query: String, in root: URL) -> [Hit] {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return [] }
@@ -69,6 +74,12 @@ enum SearchIndex {
             guard let meta = Store.meta(of: notebook) else { continue }
             if meta.title.range(of: query, options: options) != nil {
                 hits.append(Hit(notebook: notebook, title: meta.title, page: nil, snippet: "Title"))
+            }
+            if let text = try? String(contentsOf: Store.textFile(notebook), encoding: .utf8) {
+                if let match = text.range(of: query, options: options) {
+                    hits.append(Hit(notebook: notebook, title: meta.title, page: 0, snippet: snippet(text, around: match)))
+                }
+                continue
             }
             let index = load(notebook)
             for (i, id) in (meta.pages ?? []).enumerated() {

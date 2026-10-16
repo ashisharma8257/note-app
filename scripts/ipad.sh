@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build Notes, sign it with the team in project.yml, and install it on the iPad.
+# Build Notes, sign it with the free personal team (as com.ashish.Notes, without iCloud), and install it on the iPad.
 #
 #   scripts/ipad.sh install      build + install now (iPad on USB or same Wi-Fi)
 #   scripts/ipad.sh schedule     LaunchAgent that runs the install daily at 21:00
@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.."
 
 DEVICE="${NOTES_DEVICE:-00008122-001268812633801C}"
 BUNDLE_ID=com.ashish.Notes
+TEAM=7M5P7N8BH6
 LABEL=com.ashish.notes-install
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/notes-install.log"
@@ -37,9 +38,13 @@ renew_profile() {
 
 install_app() {
     renew_profile
+    scripts/board.sh
     xcodegen -q
+    mkdir -p build
+    plutil -create xml1 build/ipad.entitlements # none: a free team can't sign iCloud
     xcodebuild -project Notes.xcodeproj -scheme Notes -configuration Release \
-        -destination "id=$DEVICE" -derivedDataPath build -allowProvisioningUpdates -quiet build
+        -destination "id=$DEVICE" -derivedDataPath build -allowProvisioningUpdates -quiet \
+        DEVELOPMENT_TEAM=$TEAM PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID PRODUCT_NAME=Notes CODE_SIGN_ENTITLEMENTS=build/ipad.entitlements build
     xcrun devicectl device install app --device "$DEVICE" build/Build/Products/Release-iphoneos/Notes.app
     mkdir -p "$(dirname "$STAMP")"
     date +%s > "$STAMP"

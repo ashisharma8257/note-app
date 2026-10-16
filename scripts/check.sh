@@ -12,5 +12,5 @@ plutil -insert CFBundleIdentifier -string com.ashish.Notes.check "$out/Info.plis
 xcrun swiftc -swift-version 5 -parse-as-library -Onone -target "$(uname -m)-apple-ios17.5-macabi" -sdk "$SDK" \
     -Fsystem "$SUPPORT/System/Library/Frameworks" -I "$SUPPORT/usr/lib/swift" -L "$SUPPORT/usr/lib/swift" \
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$out/Info.plist" \
-    Notes/Notebook.swift Notes/Search.swift Notes/Shapes.swift Notes/Tools.swift Notes/Scribble.swift Notes/Tabs.swift Notes/TextBoxes.swift Notes/NotebookView.swift Tests/NotebookCheck.swift -o "$out/check"
+    Notes/Notebook.swift Notes/Sync.swift Notes/Search.swift Notes/Shapes.swift Notes/Tools.swift Notes/Scribble.swift Notes/Tabs.swift Notes/TextBoxes.swift Notes/NotebookView.swift tools/Yjs.swift Tests/NotebookCheck.swift -o "$out/check"
 "$out/check"

@@ -7,16 +7,16 @@ enum Theme {
 }
 
 /// Open notebooks shown as tabs; no selection shows the library.
-/// Tabs are paths relative to `root` because the app container's absolute path changes on reinstall.
+/// Tabs are paths relative to `root` (the library) because the app container's absolute path changes on reinstall.
 final class Tabs: ObservableObject {
     @Published private(set) var open: [String] = []
     @Published private(set) var selected: String?
     @Published var libraryPath: [URL] = []
 
     private let defaults: UserDefaults
-    private let root: URL
+    let root: URL
 
-    init(defaults: UserDefaults = .standard, root: URL = .documentsDirectory) {
+    init(defaults: UserDefaults = .standard, root: URL = Store.root) {
         self.defaults = defaults
         self.root = root
         open = (defaults.stringArray(forKey: "tabs.open") ?? []).filter { Store.isNotebook(root.appending(path: $0)) }

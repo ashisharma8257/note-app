@@ -21,7 +21,7 @@ plutil -insert CFBundleIdentifier -string com.ashish.Notes.goodnotes-import buil
 xcrun swiftc -swift-version 5 -parse-as-library -O -target "$(uname -m)-apple-ios17.5-macabi" -sdk "$SDK" \
     -Fsystem "$SUPPORT/System/Library/Frameworks" -I "$SUPPORT/usr/lib/swift" -L "$SUPPORT/usr/lib/swift" \
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker build/goodnotes-import-Info.plist \
-    Notes/Notebook.swift Notes/Search.swift Notes/TextBoxes.swift tools/GoodNotesImport.swift -o build/goodnotes-import-tool
+    Notes/Notebook.swift Notes/Sync.swift Notes/Search.swift Notes/TextBoxes.swift tools/Yjs.swift tools/GoodNotesImport.swift -o build/goodnotes-import-tool
 
 # Unzip every .goodnotes file into a same-named directory, keeping the folder tree.
 work=build/goodnotes-unpacked

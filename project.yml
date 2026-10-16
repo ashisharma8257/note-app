@@ -7,10 +7,26 @@ targets:
   Notes:
     type: application
     platform: iOS
-    sources: [Notes]
+    supportedDestinations: [iOS, macCatalyst]
+    sources:
+      - Notes
+      # Excalidraw's editor for boards, built by scripts/board.sh; a folder, so it keeps its layout in the app.
+      - path: build/board
+        type: folder
+        buildPhase: resources
     info:
       path: Notes/Info.plist
       properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.productivity
+        ITSAppUsesNonExemptEncryption: false
+        # The iCloud container's Documents shows in Files as iCloud Drive › Notes.
+        NSUbiquitousContainers:
+          iCloud.com.ashishsharma.notes: # the bundle id below, prefixed
+            NSUbiquitousContainerIsDocumentScopePublic: true
+            NSUbiquitousContainerName: Notes
+            NSUbiquitousContainerSupportedFolderLevels: Any
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
@@ -26,4 +42,15 @@ targets:
       base:
         TARGETED_DEVICE_FAMILY: "2"
         SWIFT_VERSION: "5.0"
-        DEVELOPMENT_TEAM: 7M5P7N8BH6
+        # The App Store build. scripts/ipad.sh and scripts/mac.sh sign with a free account instead: they set their own
+        # team, bundle id and name (Notes), and leave out iCloud, which only a paid team can sign.
+        DEVELOPMENT_TEAM: PK4MS63RTX
+        PRODUCT_BUNDLE_IDENTIFIER: com.ashishsharma.notes
+        PRODUCT_NAME: draw-note # the App Store name; "Notes" is Apple's
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO # the Mac app shares the iPad app's App Store record
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1" # scripts/testflight.sh sets a fresh one per upload
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Notes/Notes.entitlements
+        # On a Mac the app keeps its library in its own container, not ~/Documents.
+        CODE_SIGN_ENTITLEMENTS[sdk=macosx*]: Notes/Mac.entitlements

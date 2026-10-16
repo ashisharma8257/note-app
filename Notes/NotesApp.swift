@@ -5,26 +5,73 @@ import SwiftUI
 struct NotesApp: App {
     @StateObject private var tabs = Tabs()
     @StateObject private var tools = Tools()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             VStack(spacing: 0) {
                 TabStrip(tabs: tabs)
                 if let tab = tabs.selected {
-                    NotebookView(folder: tabs.url(tab), tools: tools).id(tab)
+                    OpenDocument(folder: tabs.url(tab), tools: tools).id(tab)
                 } else {
                     NavigationStack(path: $tabs.libraryPath) {
-                        LibraryView(dir: .documentsDirectory, title: "Notebooks")
+                        LibraryView(dir: tabs.root, title: "Notebooks")
                             .navigationDestination(for: URL.self) { LibraryView(dir: $0, title: $0.lastPathComponent) }
                     }
                 }
             }
             .environmentObject(tabs)
+            .onChange(of: scenePhase, initial: true) { _, phase in
+                if phase == .active { LibraryWatcher.shared.start() } else if phase == .background { LibraryWatcher.shared.stop() }
+            }
+            // Another device may have deleted, moved or retitled what's open.
+            .onReceive(NotificationCenter.default.publisher(for: LibraryWatcher.changed)) { _ in tabs.prune() }
         }
     }
 }
 
-/// Grid of the folders and notebooks directly inside `dir`, or search results across everything under it.
+/// The notebook, board or text document in the selected tab. It opens once iCloud has downloaded all of it, and
+/// reopens from disk when another device changes it.
+struct OpenDocument: View {
+    let folder: URL
+    @ObservedObject var tools: Tools
+    /// Its files' dates as last loaded; nil while it downloads.
+    @State private var loaded: [String: Date]?
+    @State private var revision = 0
+
+    var body: some View {
+        Group {
+            if loaded == nil {
+                ProgressView("Downloading from iCloud…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if Store.isBoard(folder) {
+                BoardView(folder: folder)
+            } else if Store.isTextDocument(folder) {
+                TextDocumentView(folder: folder)
+            } else {
+                NotebookView(folder: folder, tools: tools)
+            }
+        }
+        .id(revision)
+        .task {
+            // ponytail: checks every second; a download that never finishes (offline) leaves the tab waiting
+            while await Task.detached(operation: { [folder] in Store.requestDownloads(in: folder).missing }).value > 0 {
+                try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { return }
+            }
+            loaded = Store.fingerprint(folder)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryWatcher.changed)) { _ in
+            guard let loaded else { return }
+            let now = Store.fingerprint(folder)
+            if Store.changedElsewhere(now, since: loaded) {
+                self.loaded = now
+                revision += 1
+            }
+        }
+    }
+}
+
+/// Grid of the folders, notebooks, boards and text documents directly inside `dir`, or search results across everything under it.
 struct LibraryView: View {
     let dir: URL
     let title: String
@@ -60,6 +107,8 @@ struct LibraryView: View {
                 ForEach(Paper.allCases, id: \.self) { paper in
                     Button("New \(paper.rawValue.capitalized) Notebook") { create(paper) }
                 }
+                Button("New Text Document", systemImage: "doc.text") { newTextDocument() }
+                Button("New Excalidraw Board", systemImage: "scribble.variable") { attempt { try Store.createBoard(title: "Untitled Board", in: dir) } }
                 Button("Import…", systemImage: "square.and.arrow.down") { importing = true }
                 Divider()
                 Button("New Folder", systemImage: "folder.badge.plus") { folderName = ""; naming = true }
@@ -117,6 +166,7 @@ struct LibraryView: View {
             reload()
             SearchIndex.indexMissing(in: dir)
         }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryWatcher.changed)) { _ in reload() }
     }
 
     private var grid: some View {
@@ -186,6 +236,11 @@ struct LibraryView: View {
         attempt { try Store.create(title: "Untitled", paper: paper, pdf: pdf, in: dir) }
     }
 
+    /// Opens it right away: until it has text there is nothing to see of it in the library.
+    private func newTextDocument() {
+        attempt { tabs.open(try Store.createTextDocument(title: TextDocumentEditor.Coordinator.untitled, in: dir)) }
+    }
+
     private func attempt(_ action: () throws -> Void) {
         do { try action() } catch { self.error = error.localizedDescription }
         reload()
@@ -245,7 +300,7 @@ struct MoveSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        let root = URL.documentsDirectory
+        let root = Store.root
         // A folder can't move into itself or its own subfolders.
         let source = book.folder.standardizedFileURL.path
         let destinations = [root] + Store.allFolders(in: root).filter {

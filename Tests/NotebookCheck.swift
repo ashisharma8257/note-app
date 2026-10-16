@@ -47,7 +47,7 @@ enum NotebookCheck {
         nb = Notebook(folder: folder)
         assert(counts(nb) == [0, 3], "assigned page ids persist: \(counts(nb))")
 
-        // Deleting the only page replaces it with a blank one and drops its ink.
+        // Deleting the only page replaces it with a fresh one and drops its ink.
         nb.deletePage(at: 0)
         nb.deletePage(at: 0)
         nb = Notebook(folder: folder)
@@ -74,14 +74,21 @@ enum NotebookCheck {
         let box = CGRect(x: 10, y: 10, width: 100, height: 50)
         assert(near(bounds(.rectangle), box), "rectangle bounds: \(bounds(.rectangle))")
         assert(near(bounds(.ellipse), box), "ellipse bounds: \(bounds(.ellipse))")
+        for kind in [ShapeKind.triangle, .diamond, .roundedRectangle] {
+            let outline = kind.polylines(from: a, to: b, width: 2)[0]
+            assert(near(bounds(kind), box) && outline.first == outline.last, "\(kind.name) fills the box and closes: \(bounds(kind))")
+        }
         let shapeTools = Tools()
         shapeTools.tool = .shape
         for width in shapeTools.widthPresets {
             // renderBounds pads the ink by 1pt on each side.
-            let drawn = ShapeKind.line.strokes(from: a, to: CGPoint(x: 110, y: 10), color: .black, width: width)[0].renderBounds.height - 2
+            let drawn = ShapeKind.elbow.strokes(from: a, to: CGPoint(x: 110, y: 10), color: .black, width: width)[0].renderBounds.height - 2
             assert(abs(drawn - width) <= 1, "shape width \(width) renders \(drawn)pt wide")
         }
-        assert(ShapeKind.arrow.strokes(from: a, to: b, color: .black, width: 2).count == 2, "arrow is shaft + head")
+        let elbow = ShapeKind.elbow.polylines(from: a, to: b, width: 2)
+        assert(elbow.count == 2 && elbow[0] == [a, CGPoint(x: b.x, y: a.y), b] && elbow[1][1] == b, "elbow connector: across, down, arrowhead at the end")
+        let curve = ShapeKind.curve.polylines(from: a, to: b, width: 2)
+        assert(curve[0].first == a && curve[0].last == b && curve[1][1] == b, "curved connector runs end to end with a head")
         assert(ShapeKind.rectangle.polylines(from: a, to: b, width: 2)[0].last == a, "rectangle closes")
 
         // Pencil double-tap: eraser toggles back to whatever tool was in use.
@@ -129,6 +136,22 @@ enum NotebookCheck {
         _ = Store.importItems([source.appending(path: "Course")], into: library)
         assert(Set(names(library)) == ["/Course", "/Course 2", "Loose"], "re-import gets a new name: \(names(library))")
 
+        // Importing this app's own library (the folder of another install): notebooks come in whole, folders keep their look.
+        let otherLibrary = try Store.createFolder(named: "Other", in: source)
+        let otherFolder = try Store.createFolder(named: "Work", in: otherLibrary)
+        try Store.setFolderStyle(FolderStyle(color: "red", symbol: "star.fill"), of: otherFolder)
+        try Store.create(title: "Inked", paper: .lined, pdf: pdfDoc, in: otherFolder)
+        let inked = Notebook(folder: Store.list(in: otherFolder)[0].folder)
+        inked.setDrawing(strokes(3), at: 1)
+        inked.saveInk()
+        let fresh = try Store.createFolder(named: "fresh", in: root)
+        let otherSkipped = Store.importItems([otherLibrary], into: fresh)
+        let work = fresh.appending(path: "Other/Work")
+        let imported = Store.list(in: work)
+        assert(otherSkipped.isEmpty && imported.count == 1 && !imported[0].isFolder && imported[0].title == "Inked", "a notebook imports as itself: \(otherSkipped) \(names(work))")
+        assert(Notebook(folder: imported[0].folder).drawing(at: 1).strokes.count == 3, "with its ink")
+        assert(Store.folderStyle(work).color == "red", "a folder keeps its color")
+
         // Rename and move.
         let loose = Store.list(in: library).first { $0.title == "Loose" }!
         try Store.rename(loose, to: "  Physics  ")
@@ -153,6 +176,20 @@ enum NotebookCheck {
         let loaded = Tools(defaults: defaults)
         assert(loaded.tool == .highlighter && loaded.highlighter.width == 35 && loaded.shapeStyle.width == 3, "tools reload")
         assert(loaded.colorPresets.contains(loaded.highlighter.color), "reloaded color equals its preset")
+        loaded.eraserType = .precision
+        loaded.laserLine = false
+        loaded.shape = .diamond
+        loaded.save()
+        let reloaded = Tools(defaults: defaults)
+        assert(reloaded.eraserType == .precision && !reloaded.laserLine && reloaded.shape == .diamond, "eraser type, laser and shape reload")
+        // Settings from before eraser types and the current shapes: whole-stroke erasing, a shape no longer offered.
+        var old = try JSONSerialization.jsonObject(with: defaults.data(forKey: "tools")!) as! [String: Any]
+        old["eraserType"] = nil
+        old["eraseWholeStrokes"] = true
+        old["shape"] = "com.ashish.Notes.shape.line"
+        defaults.set(try JSONSerialization.data(withJSONObject: old), forKey: "tools")
+        let migrated = Tools(defaults: defaults)
+        assert(migrated.eraserType == .stroke && migrated.shape == .rectangle && migrated.highlighter.width == 35, "older settings still load")
 
         // Scribble to erase.
         // Dense samples like a real Pencil stroke (sparse points get smoothed away by the spline).
@@ -178,6 +215,30 @@ enum NotebookCheck {
         assert(Scribble.erase(in: PKDrawing(strokes: [word, zigzag(x: 15...85, passes: 2)])) == nil, "a couple of passes isn't a scribble")
         let mmm = ink((0...12).map { CGPoint(x: 20 + CGFloat($0) * 5, y: $0 % 2 == 0 ? 60 : 40) })
         assert(!Scribble.isScribble(mmm), "handwriting like 'mmm' isn't a scribble")
+
+        // Draw and hold: wobbly hand-drawn strokes snap to the shape they resemble.
+        func wobbly(_ corners: [CGPoint]) -> [CGPoint] {
+            ink(corners).path.map { CGPoint(x: $0.location.x + 2 * sin($0.location.y / 7), y: $0.location.y + 2 * sin($0.location.x / 5)) }
+        }
+        func near(_ p: CGPoint, _ q: CGPoint) -> Bool { hypot(p.x - q.x, p.y - q.y) < 5 }
+        let snappedLine = ShapeSnap.shape(wobbly([CGPoint(x: 0, y: 0), CGPoint(x: 200, y: 30)]))
+        assert(snappedLine?.count == 2 && near(snappedLine![1], CGPoint(x: 200, y: 30)), "line: \(String(describing: snappedLine))")
+        // Started partway along the top side and overshooting the start, like a hand-drawn box.
+        let square = ShapeSnap.shape(wobbly([CGPoint(x: 50, y: 0), CGPoint(x: 100, y: 0), CGPoint(x: 100, y: 100), CGPoint(x: 0, y: 100),
+                                             CGPoint(x: 0, y: 0), CGPoint(x: 60, y: 2)]))
+        assert(square?.count == 5 && square!.allSatisfy { [$0.x, $0.y].allSatisfy { abs($0) < 4 || abs($0 - 100) < 4 } }, "square: \(String(describing: square))")
+        let triangle = ShapeSnap.shape(wobbly([CGPoint(x: 0, y: 100), CGPoint(x: 60, y: 0), CGPoint(x: 120, y: 100), CGPoint(x: 3, y: 98)]))
+        assert(triangle?.count == 4 && near(triangle![1], CGPoint(x: 60, y: 0)), "triangle: \(String(describing: triangle))")
+        let circle = ShapeSnap.shape(wobbly((0...40).map { CGPoint(x: 100 + 50 * cos(CGFloat($0) * .pi / 20), y: 100 + 50 * sin(CGFloat($0) * .pi / 20)) }))
+        assert(circle.map { $0.count > 50 && $0.allSatisfy { abs(hypot($0.x - 100, $0.y - 100) - 50) < 4 } } == true, "circle")
+        assert(ShapeSnap.shape(mmm.path.map(\.location)) == nil, "handwriting stays as drawn")
+        assert(ShapeSnap.shape(wobbly((0...8).map { CGPoint(x: 50 + 40 * cos(CGFloat($0) * .pi / 8), y: 50 + 40 * sin(CGFloat($0) * .pi / 8)) })) == nil,
+               "an open curve stays as drawn")
+        // Once snapped, the shape follows the Pencil: a line's end goes where the Pencil goes, a closed shape scales about its centre.
+        let swung = ShapeSnap.adjusted([CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 0)], from: CGPoint(x: 100, y: 0), to: CGPoint(x: 0, y: 150))
+        assert(near(swung[0], .zero) && near(swung[1], CGPoint(x: 0, y: 150)), "line follows the Pencil: \(swung)")
+        let grown = ShapeSnap.adjusted(square!, from: CGPoint(x: 100, y: 50), to: CGPoint(x: 150, y: 50))
+        assert(grown.allSatisfy { [$0.x, $0.y].allSatisfy { abs($0 + 50) < 8 || abs($0 - 150) < 8 } }, "square doubles about its centre: \(grown)")
 
         // Tabs: open/select/close, follow renames and moves, survive relaunch.
         let tabDefaults = UserDefaults(suiteName: "notebook-check-tabs-\(UUID())")!
@@ -227,7 +288,7 @@ enum NotebookCheck {
         assert(nb.isBookmarked(0) && !nb.isBookmarked(2), "bookmark follows its page")
         assert(nb.sortedOutline.map(\.title) == ["Ribosomes", "Intro"], "outline in page order: \(nb.sortedOutline.map(\.title))")
 
-        // Paper: paper.pdf decides what new pages look like.
+        // Paper: after a document page, paper.pdf decides what a new page looks like.
         let custom = PDFDocument(data: UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 400, height: 500)).pdfData { $0.beginPage() })!
         try custom.dataRepresentation()!.write(to: bio.appending(path: "paper.pdf"))
         nb.addPage(at: 3)
@@ -312,6 +373,124 @@ enum NotebookCheck {
         let typedID = nb.pages[1]
         nb.deletePage(at: 1)
         assert(!fm.fileExists(atPath: bio.appending(path: "items/\(typedID.uuidString).json").path), "deleting a page removes its text boxes")
+
+        // Slash commands and lists in text boxes.
+        func applied(_ text: String, _ edit: TextLists.Edit?) -> String { (text as NSString).replacingCharacters(in: edit!.range, with: edit!.text) }
+        func returnKey(_ text: String) -> TextLists.Edit? { TextLists.newline(in: text, replacing: NSRange(location: (text as NSString).length, length: 0)) }
+        let typing = "Plan\n/che"
+        let slash = TextLists.slash(in: typing, before: (typing as NSString).length)
+        assert(slash?.query == "che" && SlashCommand.matching("che") == [.checklist], "slash query: \(String(describing: slash))")
+        assert(TextLists.slash(in: "and/or", before: 6) == nil, "a slash inside a word isn't a command")
+        assert(SlashCommand.matching("list") == [.bullets, .numbers], "matches any word of the title")
+        var list = applied(typing, TextLists.run(.checklist, in: typing, replacing: slash!.range)) + "Milk"
+        assert(list == "Plan\n☐ Milk", "checklist marks the line: \(list)")
+        list = applied(list, returnKey(list))
+        assert(list == "Plan\n☐ Milk\n☐ ", "Return continues the list: \(list)")
+        list = applied(list, returnKey(list))
+        assert(list == "Plan\n☐ Milk\n", "Return on an empty item ends the list: \(list)")
+        assert(returnKey("Plan") == nil && applied("3. Eggs", returnKey("3. Eggs")) == "3. Eggs\n4. " && applied("☑ Done", returnKey("☑ Done")) == "☑ Done\n☐ ",
+               "numbers count up, a ticked item continues unticked")
+        assert(applied("• a /num", TextLists.run(.numbers, in: "• a /num", replacing: NSRange(location: 4, length: 4))) == "1. a ", "a list item changes kind")
+        assert(TextLists.toggled("☐ Milk", at: 0) == "☑ Milk" && TextLists.toggled("☑ Milk", at: 0) == "☐ Milk" && TextLists.toggled("☐ Milk", at: 2) == nil, "checkbox toggles")
+        let october12 = DateComponents(calendar: .current, year: 2026, month: 10, day: 12, hour: 12).date!
+        assert(TextLists.run(.date, in: "/date", replacing: NSRange(location: 0, length: 5), now: october12).text == "Mon Oct 12 2026", "date as GoodNotes writes it")
+
+        // GoodNotes text documents: a Yjs update read back as XML text. The fixture, made with yjs 13.6, has concurrent
+        // inserts at one place (client 3 sorts first though client 7 comes first in the update), an insert inside an
+        // earlier string, deleted text and a deleted block, and an overwritten attribute.
+        let fixture = """
+            020107008403180620746f646179160300070107636f6e74656e74062800030004747970650177057469746c658703000628000302047479\
+            7065017701708703020628000304047479706501770170280003040d6c6973745374796c6554797065017704746f646f0400030005547261\
+            636b84030b0172c4030b030c016507000302062800030e0474797065017704646174652800030e046461746501770f4d6f6e204f63742031\
+            32203230323684030e012001000304058403160269742100030407636865636b656401a80319017828000304096c6973745374617274017d\
+            0284031804206e6f77810304010004010303120519012005
+            """
+        let update = stride(from: 0, to: fixture.count, by: 2).map { UInt8(fixture.dropFirst($0).prefix(2), radix: 16)! }
+        let blocks = try Yjs.root(update, name: "content").children.compactMap { if case .element(let e) = $0 { e } else { nil } }
+        func text(_ e: Yjs.Element) -> String { e.children.map { if case .text(let t) = $0 { t } else { "" } }.joined() }
+        assert(blocks.map(text) == ["Tracker", " ", "it now today"], "Yjs text: \(blocks.map(text))")
+        assert(blocks[2].attributes["checked"] as? Bool == true && blocks[2].attributes["listStart"] as? Int64 == 2, "attributes: \(blocks[2].attributes)")
+        if case .element(let date)? = blocks[1].children.first { assert(date.attributes["date"] as? String == "Mon Oct 12 2026", "inline date") } else { assert(false, "inline date") }
+
+        // New pages repeat the paper of the page before them; after a document page they get the notebook's paper.
+        for paper in Paper.allCases { assert(Store.isPaper(Store.paperPage(paper)), "\(paper) is paper") }
+        let mixed = PDFDocument()
+        mixed.insert(Store.paperPage(.grid), at: 0)
+        let printed = PDFDocument(data: UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 612, height: 792)).pdfData { ctx in
+            ctx.beginPage()
+            NSAttributedString(string: "Chapter 1").draw(at: CGPoint(x: 72, y: 72))
+        })!
+        mixed.insert(printed.page(at: 0)!, at: 1)
+        assert(!Store.isPaper(mixed.page(at: 1)!), "a page with text is a document page")
+        try Store.create(title: "Grid", paper: .blank, pdf: mixed, in: root)
+        let gridFolder = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil).first { Notebook(folder: $0).title == "Grid" }!
+        var grid = Notebook(folder: gridFolder)
+        grid.addPage(at: 1) // after the grid page
+        grid.addPage(at: 3) // after the printed page
+        grid.saveInk()
+        grid = Notebook(folder: gridFolder)
+        func looks(_ i: Int) -> Data? { grid.thumbnail(at: i, width: 120)?.pngData() }
+        assert(grid.pdf.pageCount == 4 && looks(1) == looks(0), "a page added after grid paper is grid paper")
+        assert(looks(3) != looks(0) && looks(3) != looks(2) && Store.isPaper(grid.pdf.page(at: 3)!),
+               "a page added after a document page is the notebook's (blank) paper, not a copy")
+
+        // Boards are library entries like notebooks, but covers and search never open one as a notebook.
+        let boards = try Store.createFolder(named: "Boards", in: root)
+        try Store.createBoard(title: "Sketch", in: boards)
+        let board = Store.list(in: boards)[0]
+        assert(!board.isFolder && board.title == "Sketch" && Store.isBoard(board.folder) && Store.isNotebook(board.folder), "a board is a library entry")
+        let scene = try JSONSerialization.jsonObject(with: Data(contentsOf: Store.boardFile(board.folder))) as? [String: Any]
+        assert(scene?["type"] as? String == "excalidraw", "a new board is an empty Excalidraw scene")
+        assert(Store.cover(of: board.folder) == nil, "an undrawn board has no cover")
+        SearchIndex.rebuild(board.folder, pages: nil)
+        let boardFiles = try FileManager.default.contentsOfDirectory(atPath: board.folder.path).sorted()
+        assert(boardFiles == ["board.excalidraw", "meta.json"], "cover and search leave a board's files alone: \(boardFiles)")
+        let renamedBoard = try Store.rename(board, to: "Plan")
+        assert(renamedBoard == board.folder && Store.title(of: renamedBoard) == "Plan", "a board renames like a notebook")
+        assert(SearchIndex.search("plan", in: boards).map(\.page) == [nil], "search finds a board by title")
+
+        // Text documents: their text is searched directly, and covers and the page index leave their files alone.
+        let texts = try Store.createFolder(named: "Texts", in: root)
+        let doc = try Store.createTextDocument(title: "Untitled", in: texts)
+        try Data("☐ Buy oranges\n• call Sam".utf8).write(to: Store.textFile(doc))
+        try Store.setTitle("Errands", of: doc)
+        let entry = Store.list(in: texts)[0]
+        assert(!entry.isFolder && entry.title == "Errands" && Store.isTextDocument(doc) && !Store.isBoard(doc), "a text document is a library entry")
+        assert(Store.cover(of: doc)?.size.width == 280, "a text document's cover is its text")
+        SearchIndex.rebuild(doc, pages: nil)
+        let docFiles = try FileManager.default.contentsOfDirectory(atPath: doc.path).sorted()
+        assert(docFiles == ["cover.jpg", "meta.json", "text.txt"], "no notebook files in a text document: \(docFiles)")
+        let found = SearchIndex.search("ORANGES", in: texts)
+        assert(found.count == 1 && found[0].page == 0 && found[0].snippet.contains("Buy oranges"), "search finds a text document's text: \(found)")
+        assert(SearchIndex.search("errands", in: texts).map(\.page) == [nil], "and its title")
+
+        // iCloud placeholders: a notebook whose meta.json hasn't downloaded is still a notebook, and nothing reads
+        // or writes it until it has.
+        assert(Store.placeholderTarget(URL(filePath: "/a/.meta.json.icloud"))?.path == "/a/meta.json", "placeholder names the file")
+        assert(Store.placeholderTarget(URL(filePath: "/a/.icloud")) == nil && Store.placeholderTarget(URL(filePath: "/a/x.icloud")) == nil, "only placeholders")
+        let cloud = try Store.createFolder(named: "Cloud", in: root)
+        let pending = cloud.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: pending, withIntermediateDirectories: true)
+        try Data().write(to: Store.placeholder(pending.appending(path: "meta.json")))
+        try FileManager.default.copyItem(at: folder.appending(path: "doc.pdf"), to: pending.appending(path: "doc.pdf"))
+        let pendingEntry = Store.list(in: cloud)
+        assert(pendingEntry.count == 1 && !pendingEntry[0].isFolder && Store.isNotebook(pending), "a notebook still downloading: \(pendingEntry)")
+        assert(Store.requestDownloads(in: pending).missing == 1, "its meta.json is missing")
+        _ = Notebook(folder: pending)
+        assert(Store.cover(of: pending) == nil, "no cover until it downloads")
+        SearchIndex.rebuild(pending, pages: nil)
+        let pendingFiles = try FileManager.default.contentsOfDirectory(atPath: pending.path).filter { $0 != "ink" }.sorted()
+        assert(pendingFiles == [".meta.json.icloud", "doc.pdf"], "nothing written over a notebook still downloading: \(pendingFiles)")
+
+        // An open document reopens for another device's change, not for its own saves or for caches.
+        let opened = Store.fingerprint(doc)
+        try Store.write(Data("mine".utf8), to: Store.textFile(doc))
+        try Data("cache".utf8).write(to: Store.coverURL(doc))
+        assert(!Store.changedElsewhere(Store.fingerprint(doc), since: opened), "own saves and covers aren't changes from elsewhere")
+        try Data("theirs".utf8).write(to: Store.textFile(doc))
+        assert(Store.changedElsewhere(Store.fingerprint(doc), since: opened), "another device's save is")
+        try Store.write(Data("mine again".utf8), to: Store.textFile(doc))
+        assert(!Store.changedElsewhere(Store.fingerprint(doc), since: opened), "until this app saves over it")
 
         print("NotebookCheck passed")
     }

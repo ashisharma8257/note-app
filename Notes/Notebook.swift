@@ -31,7 +31,7 @@ struct FolderStyle: Codable, Hashable {
                           "heart.fill", "lightbulb.fill", "flask.fill"]
 }
 
-/// A library entry: a notebook (directory with meta.json) or a plain folder of entries.
+/// A library entry: a notebook, board or text document (directory with meta.json) or a plain folder of entries.
 struct Book: Identifiable, Hashable {
     let folder: URL
     let title: String
@@ -41,10 +41,10 @@ struct Book: Identifiable, Hashable {
     var id: URL { folder }
 }
 
-/// A notebook is a directory (anywhere under Documents): meta.json, doc.pdf (page backgrounds),
+/// A notebook is a directory (anywhere in the library, Store.root): meta.json, doc.pdf (page backgrounds),
 /// ink/<page id>.data (one PKDrawing per page, so a save only writes the pages that changed),
 /// items/<page id>.json (typed text boxes and arrows, for pages that have any),
-/// and optionally paper.pdf (the paper new pages use), cover.jpg and search.json (both caches).
+/// and optionally paper.pdf (the paper new pages use after a page that isn't paper), cover.jpg and search.json (both caches).
 final class Notebook: ObservableObject {
     let folder: URL
     let pdf: PDFDocument
@@ -55,6 +55,8 @@ final class Notebook: ObservableObject {
     @Published var currentPage = 0
     private(set) var lastPage: Int
     weak var pdfView: PDFView?
+    /// Set by the page view: clears a page's ink and text boxes as one undo step.
+    var clearPage: ((Int) -> Void)?
     private(set) var pages: [UUID]
     /// Edited drawings not yet on disk.
     private var unsaved: [UUID: PKDrawing] = [:]
@@ -67,8 +69,8 @@ final class Notebook: ObservableObject {
     init(folder: URL) {
         self.folder = folder
         pdf = PDFDocument(url: folder.appending(path: "doc.pdf")) ?? PDFDocument()
-        let meta = (try? JSONDecoder().decode(Meta.self, from: Data(contentsOf: folder.appending(path: "meta.json"))))
-            ?? Meta(title: "Untitled", paper: .blank)
+        let saved = try? JSONDecoder().decode(Meta.self, from: Data(contentsOf: folder.appending(path: "meta.json")))
+        let meta = saved ?? Meta(title: "Untitled", paper: .blank)
         title = meta.title
         paper = meta.paper
         lastPage = meta.lastPage ?? 0
@@ -76,10 +78,11 @@ final class Notebook: ObservableObject {
         outline = meta.outline ?? []
         pages = meta.pages ?? []
         try? FileManager.default.createDirectory(at: folder.appending(path: "ink"), withIntermediateDirectories: true)
-        // Pad only, never truncate: a PDF that fails to load must not drop page ids.
+        // Pad only, never truncate: a PDF that fails to load must not drop page ids. Without a meta.json read (one
+        // iCloud hasn't downloaded yet) the ids stay in memory, so the real one isn't overwritten.
         if pages.count < pdf.pageCount {
             pages += (pages.count..<pdf.pageCount).map { _ in UUID() }
-            saveMeta()
+            if saved != nil { saveMeta() }
         }
     }
 
@@ -95,9 +98,11 @@ final class Notebook: ObservableObject {
     /// the cover and, in the background, the search index for what changed.
     func close() {
         saveInk()
+        // Only the page goes into meta.json as it is on disk: when another device changed the notebook, this one
+        // closes to reopen with that change, and the rest of what it holds is out of date.
         if let i = currentIndex, i != lastPage {
             lastPage = i
-            saveMeta()
+            Store.setLastPage(i, of: folder)
         }
         guard !changedPages.isEmpty || structureChanged else { return }
         try? FileManager.default.removeItem(at: Store.coverURL(folder))
@@ -178,8 +183,11 @@ final class Notebook: ObservableObject {
     }
 
     // ponytail: doc.pdf and meta.json are two writes; a crash between them misaligns ink from that page on (ink files survive)
+    /// A new page repeats the paper of the page before it (lined, grid, a GoodNotes template); after a page of a
+    /// document, or at the start, it gets the notebook's paper.
     func addPage(at i: Int) {
-        let page = Store.paperPage(for: folder) ?? Store.paperPage(paper)
+        let above = i > 0 ? pdf.page(at: i - 1) : nil
+        let page = above.flatMap { Store.isPaper($0) ? $0.copy() as? PDFPage : nil } ?? Store.paperPage(for: folder) ?? Store.paperPage(paper)
         pages.insert(UUID(), at: i)
         pdf.insert(page, at: i)
         structureChanged = true
@@ -192,21 +200,25 @@ final class Notebook: ObservableObject {
     /// Moves a page; its ink, bookmark and outline entries follow because they're keyed by page id.
     func movePage(from: Int, to: Int) {
         guard from != to, from < pdf.pageCount, to < pdf.pageCount, let page = pdf.page(at: from) else { return }
+        // Ids and PDF change in step, as in deletePage.
+        let id = pages.remove(at: from)
         pdf.removePage(at: from)
+        pages.insert(id, at: to)
         pdf.insert(page, at: to)
-        pages.insert(pages.remove(at: from), at: to)
         structureChanged = true
         savePDF()
         saveMeta()
         objectWillChange.send()
     }
 
-    /// Deleting the only page leaves a fresh blank page in its place.
+    /// Deleting the only page leaves a fresh page in its place.
     func deletePage(at i: Int) {
         guard i < pdf.pageCount else { return }
         if pdf.pageCount == 1 { addPage(at: 1) }
-        pdf.removePage(at: i)
+        // The id goes first: while the page is being removed, PDFView asks for the overlays (ink and text boxes) of
+        // the pages that move up, looking them up by index.
         let id = pages.remove(at: i)
+        pdf.removePage(at: i)
         unsaved[id] = nil
         changedPages.remove(id)
         bookmarks.removeAll { $0 == id }
@@ -254,7 +266,7 @@ final class Notebook: ObservableObject {
 
     @discardableResult
     private func save(_ url: URL, _ data: () throws -> Data) -> Bool {
-        do { try data().write(to: url, options: .atomic); return true }
+        do { try Store.write(data(), to: url); return true }
         catch { print("Saving \(url.lastPathComponent) failed: \(error)"); return false } // ponytail: console only, surface in UI if it ever happens
     }
 
@@ -321,8 +333,42 @@ final class Notebook: ObservableObject {
 }
 
 enum Store {
+    /// True for notebooks, boards and text documents: they all open in a tab.
     static func isNotebook(_ dir: URL) -> Bool {
-        FileManager.default.fileExists(atPath: dir.appending(path: "meta.json").path)
+        exists(dir.appending(path: "meta.json"))
+    }
+
+    /// A board is a directory with meta.json (its title) and board.excalidraw (the Excalidraw scene), plus cover.jpg
+    /// once it has been drawn on.
+    static func boardFile(_ dir: URL) -> URL { dir.appending(path: "board.excalidraw") }
+
+    /// The Excalidraw library (saved shapes), shared by every board; hidden, so the library list skips it.
+    static var boardLibrary: URL { root.appending(path: libraryName) }
+    static let libraryName = ".library.excalidrawlib"
+
+    static func isBoard(_ dir: URL) -> Bool { exists(boardFile(dir)) }
+
+    /// A text document is a directory with meta.json (its title) and text.txt (its body, lists written the way
+    /// TextLists reads them).
+    static func textFile(_ dir: URL) -> URL { dir.appending(path: "text.txt") }
+
+    static func isTextDocument(_ dir: URL) -> Bool { exists(textFile(dir)) }
+
+    /// Returns the new document.
+    @discardableResult
+    static func createTextDocument(title: String, in parent: URL) throws -> URL {
+        let dir = parent.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data().write(to: textFile(dir))
+        try JSONEncoder().encode(Meta(title: title, paper: .blank, pages: [])).write(to: dir.appending(path: "meta.json"))
+        return dir
+    }
+
+    static func createBoard(title: String, in parent: URL) throws {
+        let dir = parent.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data(#"{"type":"excalidraw","version":2,"source":"Notes","elements":[],"appState":{},"files":{}}"#.utf8).write(to: boardFile(dir))
+        try JSONEncoder().encode(Meta(title: title, paper: .blank, pages: [])).write(to: dir.appending(path: "meta.json"))
     }
 
     static func meta(of notebook: URL) -> Meta? {
@@ -335,7 +381,7 @@ enum Store {
     static func setLastPage(_ i: Int, of notebook: URL) {
         guard var meta = meta(of: notebook) else { return }
         meta.lastPage = i
-        try? JSONEncoder().encode(meta).write(to: notebook.appending(path: "meta.json"), options: .atomic)
+        try? write(JSONEncoder().encode(meta), to: notebook.appending(path: "meta.json"))
     }
 
     /// Every notebook under `root`, at any depth.
@@ -353,13 +399,60 @@ enum Store {
 
     static func coverURL(_ notebook: URL) -> URL { notebook.appending(path: "cover.jpg") }
 
-    /// Page 1 as a cover image, from cover.jpg or rendered and saved there. Notebook.close() deletes the
-    /// file after changes, so the next request redraws it.
+    /// Page 1 as a cover image, from cover.jpg or rendered and saved there. Notebook.close() and text documents
+    /// delete the file after changes, so the next request redraws it. A board writes its own cover.jpg as it saves.
+    /// Nil until iCloud has downloaded the whole document.
     static func cover(of notebook: URL) -> UIImage? {
-        if let image = UIImage(contentsOfFile: coverURL(notebook).path) { return image }
-        guard let image = Notebook(folder: notebook).thumbnail(at: 0, width: 280) else { return nil }
+        if !isMissing(coverURL(notebook)), let image = UIImage(contentsOfFile: coverURL(notebook).path) { return image }
+        guard !isBoard(notebook), requestDownloads(in: notebook).missing == 0,
+              let image = isTextDocument(notebook) ? textCover(notebook, width: 280) : Notebook(folder: notebook).thumbnail(at: 0, width: 280)
+        else { return nil }
         try? image.jpegData(compressionQuality: 0.85)?.write(to: coverURL(notebook), options: .atomic)
         return image
+    }
+
+    /// A text document's title and the start of its text on a white letter-size page, `width` points wide.
+    private static func textCover(_ doc: URL, width: CGFloat) -> UIImage {
+        let page = CGRect(x: 0, y: 0, width: 612, height: 792)
+        return UIGraphicsImageRenderer(size: CGSize(width: width, height: width * page.height / page.width)).image { ctx in
+            ctx.cgContext.scaleBy(x: width / page.width, y: width / page.width)
+            UIColor.white.setFill()
+            UIRectFill(page)
+            let text = (try? String(contentsOf: textFile(doc), encoding: .utf8)) ?? ""
+            NSAttributedString(string: title(of: doc), attributes: [.font: UIFont.boldSystemFont(ofSize: 34), .foregroundColor: UIColor.black])
+                .draw(in: CGRect(x: 54, y: 54, width: 504, height: 44))
+            NSAttributedString(string: text, attributes: [.font: UIFont.systemFont(ofSize: 18), .foregroundColor: UIColor.black])
+                .draw(in: CGRect(x: 54, y: 114, width: 504, height: 624))
+        }
+    }
+
+    /// True for a page that's only vector drawing: paper (blank, lined, grid, a template) rather than a page of a
+    /// document, which has text or pictures.
+    static func isPaper(_ page: PDFPage) -> Bool {
+        var resources: CGPDFDictionaryRef?
+        guard let dict = page.pageRef?.dictionary, CGPDFDictionaryGetDictionary(dict, "Resources", &resources), let resources else { return true }
+        return !hasTextOrPictures(resources)
+    }
+
+    /// Whether these PDF resources hold fonts or images, looking into nested form drawings too.
+    private static func hasTextOrPictures(_ resources: CGPDFDictionaryRef, depth: Int = 0) -> Bool {
+        var fonts: CGPDFDictionaryRef?
+        if CGPDFDictionaryGetDictionary(resources, "Font", &fonts), let fonts, CGPDFDictionaryGetCount(fonts) > 0 { return true }
+        var objects: CGPDFDictionaryRef?
+        guard CGPDFDictionaryGetDictionary(resources, "XObject", &objects), let objects else { return false }
+        var found = false
+        CGPDFDictionaryApplyBlock(objects, { _, object, _ in
+            var stream: CGPDFStreamRef?
+            guard CGPDFObjectGetValue(object, .stream, &stream), let stream, let dict = CGPDFStreamGetDictionary(stream) else { return true }
+            var subtype: UnsafePointer<CChar>?, inner: CGPDFDictionaryRef?
+            if CGPDFDictionaryGetName(dict, "Subtype", &subtype), let subtype, String(cString: subtype) == "Image" {
+                found = true
+            } else if depth < 4, CGPDFDictionaryGetDictionary(dict, "Resources", &inner), let inner {
+                found = hasTextOrPictures(inner, depth: depth + 1)
+            }
+            return !found
+        }, nil)
+        return found
     }
 
     /// The notebook's own paper (paper.pdf, e.g. a template brought over from GoodNotes), if it has one.
@@ -379,8 +472,12 @@ enum Store {
             // Ink saves only touch ink/, so it counts toward the notebook's modified date.
             let inkModified = try? dir.appending(path: "ink").resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
             let modified = max(values?.contentModificationDate ?? .distantPast, inkModified ?? .distantPast)
-            guard let data = try? Data(contentsOf: dir.appending(path: "meta.json")) else {
+            let metaFile = dir.appending(path: "meta.json")
+            guard exists(metaFile) else {
                 return Book(folder: dir, title: dir.lastPathComponent, modified: modified, isFolder: true, style: folderStyle(dir))
+            }
+            guard !isMissing(metaFile), let data = try? Data(contentsOf: metaFile) else {
+                return Book(folder: dir, title: "Downloading…", modified: modified, isFolder: false)
             }
             guard let meta = try? JSONDecoder().decode(Meta.self, from: data) else { return nil }
             return Book(folder: dir, title: meta.title, modified: modified, isFolder: false)
@@ -418,11 +515,16 @@ enum Store {
             try FileManager.default.moveItem(at: book.folder, to: target)
             return target
         }
-        let url = book.folder.appending(path: "meta.json")
-        var meta = try JSONDecoder().decode(Meta.self, from: Data(contentsOf: url))
-        meta.title = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        try JSONEncoder().encode(meta).write(to: url, options: .atomic)
+        try setTitle(name, of: book.folder)
         return book.folder
+    }
+
+    /// Retitles a notebook, board or text document.
+    static func setTitle(_ title: String, of notebook: URL) throws {
+        let url = notebook.appending(path: "meta.json")
+        var meta = try JSONDecoder().decode(Meta.self, from: Data(contentsOf: url))
+        meta.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        try write(JSONEncoder().encode(meta), to: url)
     }
 
     /// Returns where the item now lives.
@@ -442,7 +544,8 @@ enum Store {
         list(in: root).filter(\.isFolder).flatMap { [$0.folder] + allFolders(in: $0.folder) }
     }
 
-    /// Copies picked PDFs and folders into `parent`, recreating folder structure.
+    /// Copies picked PDFs and folders into `parent`, recreating folder structure. Notebooks, boards and text documents
+    /// (from this app's library on another device, say) come in whole, ink and all, and folders keep their look.
     /// Returns the names of items that weren't imported.
     static func importItems(_ urls: [URL], into parent: URL) -> [String] {
         urls.flatMap { url in
@@ -455,12 +558,17 @@ enum Store {
     private static func importItem(_ url: URL, into parent: URL) -> [String] {
         let name = url.lastPathComponent
         if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+            if isNotebook(url) {
+                do { try FileManager.default.copyItem(at: url, to: parent.appending(path: uniqueName(name, in: parent))) } catch { return [name] }
+                return []
+            }
             do {
                 let dir = try createFolder(named: uniqueName(name, in: parent), in: parent)
                 let children = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey])
                 return children.sorted { $0.lastPathComponent < $1.lastPathComponent }.flatMap { child -> [String] in
                     let childName = child.lastPathComponent
                     guard childName.hasPrefix(".") else { return importItem(child, into: dir) }
+                    if childName == ".folder.json" { try? FileManager.default.copyItem(at: child, to: dir.appending(path: childName)) }
                     // iCloud files not on this device show up as hidden ".name.icloud" placeholders.
                     return childName.hasSuffix(".icloud") ? ["\(childName.dropFirst().dropLast(7)) (not downloaded)"] : []
                 }

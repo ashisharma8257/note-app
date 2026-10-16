@@ -8,6 +8,7 @@ struct NotebookView: View {
     @ObservedObject var tools: Tools
     @EnvironmentObject private var tabs: Tabs
     @State private var confirmDelete = false
+    @State private var confirmClear = false
     @State private var showPages = false
     @State private var renaming = false
     @State private var addingOutline = false
@@ -39,7 +40,10 @@ struct NotebookView: View {
                 Menu {
                     Button("Add to Outline…", systemImage: "list.bullet.indent") { outlineTitle = ""; addingOutline = true }
                     Button("Rename Notebook", systemImage: "pencil") { newTitle = nb.title; renaming = true }
-                    Button("Delete Page", systemImage: "trash", role: .destructive) { confirmDelete = true }
+                    Section("Clear or Delete Page") {
+                        Button("Clear Page", systemImage: "xmark.square", role: .destructive) { confirmClear = true }
+                        Button("Delete Page", systemImage: "trash", role: .destructive) { confirmDelete = true }
+                    }
                 } label: {
                     Image(systemName: "ellipsis.circle").font(.system(size: 20)).frame(width: 44, height: 44)
                 }
@@ -65,8 +69,17 @@ struct NotebookView: View {
                 .ignoresSafeArea(edges: .bottom)
         }
         .environment(\.colorScheme, .light) // GoodNotes-style chrome and paper look the same in dark mode
-        .confirmationDialog("Delete this page?", isPresented: $confirmDelete) {
-            Button("Delete Page", role: .destructive) { if let i = nb.currentIndex { nb.deletePage(at: i) } }
+        .alert("Delete Page?", isPresented: $confirmDelete) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { if let i = nb.currentIndex { nb.deletePage(at: i) } }
+        } message: {
+            Text("Page \(nb.currentPage + 1) and everything on it will be deleted.")
+        }
+        .alert("Clear Page?", isPresented: $confirmClear) {
+            Button("Cancel", role: .cancel) {}
+            Button("Clear", role: .destructive) { if let i = nb.currentIndex { nb.clearPage?(i) } }
+        } message: {
+            Text("Removes the ink and text boxes on page \(nb.currentPage + 1). Undo brings them back.")
         }
         .alert("Rename Notebook", isPresented: $renaming) {
             TextField("Title", text: $newTitle)
@@ -289,6 +302,23 @@ struct PDFCanvas: UIViewRepresentable {
             view.addGestureRecognizer(tap)
         }
         nb.pdfView = view
+        nb.clearPage = { [weak coordinator = context.coordinator] in coordinator?.clear(page: $0) }
+        let hint = context.coordinator.pullHint
+        hint.font = .preferredFont(forTextStyle: .footnote)
+        hint.textColor = .gray
+        hint.alpha = 0
+        hint.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(hint)
+        NSLayoutConstraint.activate([
+            hint.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            hint.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+        ])
+        let pull = context.coordinator.pullGesture
+        pull.addTarget(context.coordinator, action: #selector(Coordinator.pulled(_:)))
+        pull.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)] // scrolling is a finger thing
+        pull.cancelsTouchesInView = false
+        pull.delegate = context.coordinator
+        view.addGestureRecognizer(pull)
         // PencilKit can keep stale or missing tiles after PDFView rescales an existing ink overlay (fit to
         // width, rotation, pinch zoom), so redraw the ink once each scale change settles.
         context.coordinator.scaleObserver = NotificationCenter.default.addObserver(
@@ -310,19 +340,23 @@ struct PDFCanvas: UIViewRepresentable {
         context.coordinator.overlays.values.forEach(context.coordinator.applyTool)
     }
 
-    /// One page's overlay: the ink canvas, with a shape-drawing view on top that takes touches
-    /// only while the shape tool is selected, so PencilKit never sees shape drags.
+    /// One page's overlay: the ink canvas, with shape-drawing and laser views on top that take touches
+    /// only while their tool is selected, so PencilKit never sees shape drags or the laser.
     final class PageOverlay: UIView {
         weak var page: PDFPage?
         let canvas = PKCanvasView()
         let items = ItemsView()
         let shapeView = UIView()
+        let laser = LaserView()
+        let hold = HoldGesture()
 
         override init(frame: CGRect) {
             super.init(frame: frame)
+            canvas.addGestureRecognizer(hold)
             addSubview(canvas)
             addSubview(items)
             addSubview(shapeView)
+            addSubview(laser)
         }
 
         required init?(coder: NSCoder) { fatalError("not used") }
@@ -332,6 +366,7 @@ struct PDFCanvas: UIViewRepresentable {
             canvas.frame = bounds
             items.frame = bounds
             shapeView.frame = bounds
+            laser.frame = bounds
         }
     }
 
@@ -356,8 +391,19 @@ struct PDFCanvas: UIViewRepresentable {
         }
         private let preview = CAShapeLayer()
         private var dragStart = CGPoint.zero
+        /// The points of a freehand shape being drawn.
+        private var freehand: [CGPoint] = []
+        /// Watches finger drags, alongside PDFView's own scrolling, for a pull up past the last page.
+        let pullGesture = UIPanGestureRecognizer()
+        /// Shown below the last page while pulling up past it.
+        let pullHint = UILabel()
         /// Newest stroke already checked for scribble-to-erase; older strokes (undo, lasso moves) are never rechecked.
         private var lastChecked = Date()
+        /// Draw and hold in progress: the shape as snapped, where the Pencil was then, and the drawing without the stroke.
+        private var snap: (shape: [CGPoint], from: CGPoint, base: PKDrawing)?
+        /// Per ink, the pen or highlighter width last drawn with it and the middle point of that stroke, so snapped
+        /// shapes match the user's own ink.
+        private var inkSamples: [PKInk.InkType: (width: CGFloat, point: PKStrokePoint)] = [:]
 
         init(nb: Notebook, tools: Tools) {
             self.nb = nb
@@ -392,6 +438,10 @@ struct PDFCanvas: UIViewRepresentable {
             drag.allowedTouchTypes = touches.map { NSNumber(value: $0.rawValue) }
             drag.delegate = self
             overlay.shapeView.addGestureRecognizer(drag)
+            overlay.hold.allowedTouchTypes = drag.allowedTouchTypes
+            overlay.laser.gesture.allowedTouchTypes = drag.allowedTouchTypes
+            overlay.hold.shouldBegin = { [weak self] in self?.beginSnap($0) ?? false }
+            overlay.hold.addTarget(self, action: #selector(followSnap(_:)))
             applyTool(to: overlay)
 
             overlays[page] = overlay
@@ -410,15 +460,57 @@ struct PDFCanvas: UIViewRepresentable {
         func canvasViewDrawingDidChange(_ canvas: PKCanvasView) {
             guard let page = (canvas.superview as? PageOverlay)?.page, let i = nb.index(of: page) else { return }
             nb.setDrawing(canvas.drawing, at: i)
-            eraseIfScribbled(on: canvas)
+            checkNewStroke(on: canvas)
         }
 
-        private func eraseIfScribbled(on canvas: PKCanvasView) {
-            guard tools.tool == .pen, let newest = canvas.drawing.strokes.last, newest.path.creationDate > lastChecked else { return }
+        /// Remembers how each new pen or highlighter stroke looks, for draw and hold; a new pen scribble erases the ink under it.
+        private func checkNewStroke(on canvas: PKCanvasView) {
+            guard tools.tool == .pen || tools.tool == .highlighter, let newest = canvas.drawing.strokes.last,
+                  newest.path.creationDate > lastChecked, !newest.path.isEmpty else { return }
             lastChecked = newest.path.creationDate
-            guard let erased = Scribble.erase(in: canvas.drawing) else { return }
+            inkSamples[newest.ink.inkType] = (tools.style.width, newest.path[newest.path.count / 2])
+            // During a snap this is PencilKit keeping the stroke it was cut off from; the snap's next update replaces it.
+            guard snap == nil, tools.tool == .pen, let erased = Scribble.erase(in: canvas.drawing) else { return }
             // Undo brings back the erased ink without the scribble itself.
             replaceDrawing(of: canvas, with: erased, previous: PKDrawing(strokes: canvas.drawing.strokes.dropLast()))
+        }
+
+        /// Draw and hold: when the stroke held still resembles a shape, takes the stroke from PencilKit
+        /// so `followSnap` can show the shape instead.
+        private func beginSnap(_ hold: HoldGesture) -> Bool {
+            guard let canvas = hold.view as? PKCanvasView, let from = hold.points.last,
+                  let shape = ShapeSnap.shape(hold.points) else { return false }
+            snap = (shape, from, canvas.drawing)
+            // Disabling the drawing gesture cancels the stroke in progress; the touch stays with HoldGesture.
+            canvas.drawingGestureRecognizer.isEnabled = false
+            canvas.drawingGestureRecognizer.isEnabled = true
+            return true
+        }
+
+        /// Shows the snapped shape following the Pencil, and keeps it, with one undo step, when the Pencil lifts.
+        @objc private func followSnap(_ hold: HoldGesture) {
+            guard let canvas = hold.view as? PKCanvasView, let snap, let tool = tools.pkTool as? PKInkingTool else { return }
+            let shape = ShapeSnap.adjusted(snap.shape, from: snap.from, to: hold.location(in: canvas))
+            // Sized like the user's last stroke in this ink, scaled to the current width. With no stroke yet, the size is
+            // a guess carried over from the ballpoint measurement in ShapeKind.strokes.
+            let sample = inkSamples[tool.inkType]
+            let scale = sample.map { tools.style.width / $0.width } ?? 1
+            let size = sample.map { CGSize(width: $0.point.size.width * scale, height: $0.point.size.height * scale) }
+                ?? CGSize(width: tool.width + 2, height: tool.width + 2)
+            let template = PKStrokePoint(location: .zero, timeOffset: 0, size: size, opacity: sample?.point.opacity ?? 1,
+                                         force: sample?.point.force ?? 1, azimuth: sample?.point.azimuth ?? 0,
+                                         altitude: sample?.point.altitude ?? .pi / 2)
+            // Stamped as already checked, so checkNewStroke leaves it alone.
+            let drawing = PKDrawing(strokes: snap.base.strokes + [PKStroke(along: shape, ink: tool.ink, like: template, created: lastChecked)])
+            switch hold.state {
+            case .began, .changed:
+                canvas.drawing = drawing
+            case .ended, .cancelled:
+                self.snap = nil
+                replaceDrawing(of: canvas, with: drawing, previous: snap.base)
+            default:
+                break
+            }
         }
 
         /// Makes PencilKit render each visible canvas again from scratch.
@@ -436,6 +528,9 @@ struct PDFCanvas: UIViewRepresentable {
         func applyTool(to overlay: PageOverlay) {
             overlay.canvas.tool = tools.pkTool
             overlay.shapeView.isHidden = tools.tool != .shape // hidden views receive no touches
+            overlay.laser.isHidden = tools.tool != .laser
+            overlay.laser.line = tools.laserLine
+            overlay.hold.isEnabled = tools.tool == .pen || tools.tool == .highlighter
             overlay.items.active = tools.tool == .text
             overlay.items.setStyle(color: tools.textStyle.color, size: tools.textStyle.width)
         }
@@ -456,24 +551,54 @@ struct PDFCanvas: UIViewRepresentable {
             case .began:
                 let moved = drag.translation(in: shapeView)
                 dragStart = CGPoint(x: end.x - moved.x, y: end.y - moved.y)
+                freehand = [dragStart]
                 preview.strokeColor = style.color.cgColor
                 preview.lineWidth = style.width
                 shapeView.layer.addSublayer(preview)
                 fallthrough
             case .changed:
+                freehand.append(end)
                 let path = UIBezierPath()
-                for line in tools.shape.polylines(from: dragStart, to: end, width: style.width) {
+                for line in tools.shape == .freehand ? [freehand] : tools.shape.polylines(from: dragStart, to: end, width: style.width) {
                     path.move(to: line[0])
                     line.dropFirst().forEach(path.addLine(to:))
                 }
                 preview.path = path.cgPath
             case .ended:
                 preview.removeFromSuperlayer()
-                guard hypot(end.x - dragStart.x, end.y - dragStart.y) > 2 else { return }
-                let strokes = tools.shape.strokes(from: dragStart, to: end, color: style.color, width: style.width)
+                guard hypot(end.x - dragStart.x, end.y - dragStart.y) > 2 || freehand.count > 2 else { return }
+                // A freehand shape becomes the shape it resembles, or stays as drawn when it resembles none.
+                let strokes = tools.shape == .freehand
+                    ? ShapeKind.strokes([ShapeSnap.shape(freehand + [end]) ?? freehand + [end]], color: style.color, width: style.width)
+                    : tools.shape.strokes(from: dragStart, to: end, color: style.color, width: style.width)
                 replaceDrawing(of: overlay.canvas, with: overlay.canvas.drawing.appending(PKDrawing(strokes: strokes)), previous: overlay.canvas.drawing)
             default:
                 preview.removeFromSuperlayer()
+            }
+        }
+
+        /// Clears a page's ink and text boxes; undo (one step, as UndoManager groups by event) brings them back.
+        func clear(page i: Int) {
+            guard let page = nb.pdf.page(at: i), let overlay = overlays[page] else { return }
+            replaceDrawing(of: overlay.canvas, with: PKDrawing(), previous: overlay.canvas.drawing)
+            overlay.items.removeAll()
+        }
+
+        /// Pull up past the last page and let go to add a page there; the hint below says when letting go will.
+        @objc func pulled(_ pan: UIPanGestureRecognizer) {
+            guard let scroll = pan.view?.subviews.lazy.compactMap({ $0 as? UIScrollView }).first else { return }
+            let inset = scroll.adjustedContentInset
+            let resting = max(scroll.contentSize.height + inset.bottom - scroll.bounds.height, -inset.top)
+            let pull = scroll.contentOffset.y - resting
+            switch pan.state {
+            case .began, .changed:
+                pullHint.text = pull > 120 ? "Release to add a page" : "Pull up to add a page"
+                pullHint.alpha = min(1, max(0, pull / 60))
+            case .ended where pull > 120:
+                pullHint.alpha = 0
+                nb.addPage(at: nb.pdf.pageCount)
+            default:
+                pullHint.alpha = 0
             }
         }
 
@@ -488,7 +613,73 @@ struct PDFCanvas: UIViewRepresentable {
 
         /// The PDF's scroll view waits for a shape drag, so dragging a shape doesn't scroll the page.
         func gestureRecognizer(_ gesture: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
-            other.view is UIScrollView
+            gesture !== pullGesture && other.view is UIScrollView
+        }
+
+        /// Watching for a pull never gets in the way of scrolling.
+        func gestureRecognizer(_ gesture: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            gesture === pullGesture
+        }
+    }
+}
+
+/// The laser pointer: a glowing red dot under the Pencil, or a glowing red line that fades away soon after the Pencil
+/// lifts. Nothing is kept.
+final class LaserView: UIView {
+    var line = true
+    let gesture = UILongPressGestureRecognizer()
+    private var trail = UIBezierPath()
+    private var current: CAShapeLayer?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        gesture.minimumPressDuration = 0
+        gesture.allowableMovement = .greatestFiniteMagnitude
+        gesture.addTarget(self, action: #selector(track(_:)))
+        addGestureRecognizer(gesture)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func track(_ gesture: UILongPressGestureRecognizer) {
+        let p = gesture.location(in: self)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        switch gesture.state {
+        case .began:
+            let glow = CAShapeLayer()
+            glow.strokeColor = UIColor.systemRed.cgColor
+            glow.fillColor = line ? nil : UIColor.systemRed.cgColor
+            glow.lineWidth = 3
+            glow.lineCap = .round
+            glow.lineJoin = .round
+            glow.shadowColor = UIColor.systemRed.cgColor
+            glow.shadowRadius = 6
+            glow.shadowOpacity = 1
+            glow.shadowOffset = .zero
+            layer.addSublayer(glow)
+            current = glow
+            trail = UIBezierPath()
+            trail.move(to: p)
+            fallthrough
+        case .changed:
+            if line {
+                trail.addLine(to: p)
+                current?.path = trail.cgPath
+            } else {
+                current?.path = UIBezierPath(arcCenter: p, radius: 5, startAngle: 0, endAngle: 2 * .pi, clockwise: true).cgPath
+            }
+        default:
+            guard let glow = current else { return }
+            current = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + (line ? 0.6 : 0)) { [line] in
+                CATransaction.begin()
+                CATransaction.setAnimationDuration(line ? 0.5 : 0.2)
+                CATransaction.setCompletionBlock { glow.removeFromSuperlayer() }
+                glow.opacity = 0
+                CATransaction.commit()
+            }
         }
     }
 }

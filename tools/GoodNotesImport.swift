@@ -13,6 +13,7 @@ import UIKit
 //                     whiteboards (64), outline entries (62), bookmarks (56)
 //   notes/<id>        one page's elements; ink is kind 7, an Apple-LZ4 ("bv41") compressed `tpl`
 //                     image holding a path of quadratic curves; images are kind 1 (frame + attachment);
+//                     a text document's page is kind 13, a Plate editor document as a Yjs update (Yjs.swift);
 //                     a page's ink file id is its page id + 1
 //   attachments/<id>  PDFs: paper templates and imported documents
 //   thumbnail.jpg     page 1, used here to check each conversion
@@ -178,6 +179,7 @@ struct PageInk {
     var images: [(attachment: String, frame: CGRect)] = []
     var textBoxes: [String: GNTextBox] = [:]
     var connectors: [GNConnector] = []
+    var document: [String]? // a text document's lines, title first
     var shapes = 0
     var unsupported = 0 // strokes and elements in formats this converter doesn't read
 }
@@ -214,7 +216,7 @@ enum GoodNotes {
             case 1: addImage(fields, to: &page)
             case 21: try addTextBox(id, fields, to: &page)
             case 22: addConnector(fields, to: &page)
-            default: page.unsupported += 1 // 13: typed-text pages
+            default: page.document = try document(fields) // 13
             }
         }
         return page
@@ -321,6 +323,50 @@ enum GoodNotes {
         }
         guard runs.contains(where: { !$0.0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else { return }
         page.textBoxes[id] = GNTextBox(frame: CGRect(x: origin.x, y: origin.y, width: size.x, height: size.y), runs: runs)
+    }
+
+    /// Text document (kind 13): the Plate editor's value as a Yjs update in field 10, under the root "content". Its
+    /// blocks are XML text elements with attributes (type, listStyleType, checked, listStart, indent); dates are inline
+    /// elements. Becomes plain lines, with lists written the way this app's text boxes write them (TextLists).
+    private static func document(_ fields: [Field]) throws -> [String]? {
+        guard let update = fields.field(10)?.bytes, !update.isEmpty else { return nil }
+        var lines: [String] = []
+        for case .element(let block) in try Yjs.root(update, name: "content").children { lines += documentLines(block) }
+        // One blank line at most between paragraphs, none at the ends.
+        lines = lines.reduce(into: []) { out, line in if !line.isEmpty || out.last?.isEmpty == false { out.append(line) } }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        return lines
+    }
+
+    private static func documentLines(_ block: Yjs.Element) -> [String] {
+        func int(_ value: Any?) -> Int? { (value as? Int64).map(Int.init) ?? (value as? Double).map(Int.init) }
+        var text = "", nested: [String] = [], dated = false
+        for child in block.children {
+            switch child {
+            case .text(let run): text += run
+            case .element(let e):
+                switch e.attributes["type"] as? String {
+                case "date":
+                    text += e.attributes["date"] as? String ?? ""
+                    dated = true
+                case "slash_input": break // a slash command being typed
+                default: nested += documentLines(e) // table rows and cells, or anything else holding blocks
+                }
+            }
+        }
+        let a = block.attributes
+        let marker = switch a["listStyleType"] as? String {
+        case "todo": a["checked"] as? Bool == true ? TextLists.checked : TextLists.unchecked
+        case "decimal": "\(int(a["listStart"]) ?? 1). "
+        case .some: TextLists.bullet
+        case nil: ""
+        }
+        let indent = String(repeating: "    ", count: max(0, (int(a["indent"]) ?? 0) - (marker.isEmpty ? 0 : 1)))
+        let own = text.trimmingCharacters(in: .whitespaces)
+        let lines = nested.isEmpty || !own.isEmpty ? [indent + marker + own] + nested : nested
+        // GoodNotes shows a date as a chip; a blank line before a dated paragraph keeps such headings apart.
+        // Table rows get a blank line after them.
+        return (dated && marker.isEmpty ? [""] : []) + lines + (a["type"] as? String == "tr" ? [""] : [])
     }
 
     /// Connector between two text boxes, each end given as an angle on that box's edge.
@@ -524,8 +570,7 @@ func convert(archive dir: URL, fallbackTitle: String, into parent: URL) throws -
 
     let pdf = PDFDocument()
     var ids: [UUID] = [], drawings: [PKDrawing] = [], itemsByPage: [UUID: PageItems] = [:]
-    func add(_ page: PDFPage, id: String, drawing: PKDrawing, ink: PageInk, scale: CGFloat) {
-        let items = editableItems(ink, scale: scale)
+    func add(_ page: PDFPage, id: String, drawing: PKDrawing, ink: PageInk, items: PageItems) {
         if !items.isEmpty, let uuid = UUID(uuidString: id) { itemsByPage[uuid] = items }
         pdf.insert(page, at: pdf.pageCount)
         ids.append(UUID(uuidString: id) ?? UUID())
@@ -561,7 +606,18 @@ func convert(archive dir: URL, fallbackTitle: String, into parent: URL) throws -
         let strokes = ink.strokes.flatMap { pencilKitStrokes($0, scale: scale, offset: .zero) }
         let finished = decorated(background ?? blankPage(size), ink, scale: scale)
         geometry[page.id] = (scale, finished.bounds(for: .cropBox).height)
-        add(finished, id: page.id, drawing: PKDrawing(strokes: strokes), ink: ink, scale: scale)
+        guard let document = ink.document else {
+            add(finished, id: page.id, drawing: PKDrawing(strokes: strokes), ink: ink, items: editableItems(ink, scale: scale))
+            continue
+        }
+        // A text document scrolls without pages in GoodNotes; here it continues onto copies of its page.
+        for (k, items) in documentPages(document, size: finished.bounds(for: .cropBox).size).enumerated() {
+            if k == 0 {
+                add(finished, id: page.id, drawing: PKDrawing(strokes: strokes), ink: ink, items: items)
+            } else if let copy = finished.copy() as? PDFPage {
+                add(copy, id: UUID().uuidString, drawing: PKDrawing(), ink: PageInk(), items: items)
+            }
+        }
     }
 
     // Whiteboards are unbounded canvases: one page fitted around the ink, at 1 GoodNotes unit per point.
@@ -571,7 +627,7 @@ func convert(archive dir: URL, fallbackTitle: String, into parent: URL) throws -
         guard let first = points.first else { continue }
         let bounds = points.reduce(CGRect(origin: first, size: .zero)) { $0.union(CGRect(origin: $1, size: .zero)) }.insetBy(dx: -40, dy: -40)
         let strokes = ink.strokes.flatMap { pencilKitStrokes($0, scale: 1, offset: bounds.origin) }
-        add(blankPage(bounds.size), id: id, drawing: PKDrawing(strokes: strokes), ink: ink, scale: 1)
+        add(blankPage(bounds.size), id: id, drawing: PKDrawing(strokes: strokes), ink: ink, items: editableItems(ink, scale: 1))
     }
 
     guard pdf.pageCount > 0, let data = pdf.dataRepresentation() else { throw CocoaError(.fileWriteUnknown) }
@@ -612,6 +668,37 @@ func convert(archive dir: URL, fallbackTitle: String, into parent: URL) throws -
     _ = Store.cover(of: notebook)
     SearchIndex.rebuild(notebook, pages: nil)
     return (notebook, report)
+}
+
+/// A text document's lines (title first) as text boxes filling pages of `size` points, one box per page: the title
+/// in 20 pt, the rest in 12 pt (a Text tool size, so boxes added later match).
+func documentPages(_ lines: [String], size: CGSize) -> [PageItems] {
+    let margin = (size.width * 0.07).rounded(), width = size.width - 2 * margin
+    func box(_ lines: [String], top: CGFloat, fontSize: CGFloat) -> TextBox {
+        var box = TextBox(frame: CGRect(x: margin, y: top, width: width, height: 0), text: lines.joined(separator: "\n"), fontSize: fontSize)
+        let text = NSAttributedString(string: box.text, attributes: PageItems.attributes(box))
+        let bounds = text.boundingRect(with: CGSize(width: width - 2 * PageItems.inset, height: .greatestFiniteMagnitude),
+                                       options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
+        box.frame.size.height = ceil(bounds.height) + 2 * PageItems.inset
+        return box
+    }
+    guard let title = lines.first else { return [PageItems()] }
+    var pages = [PageItems(boxes: [box([title], top: margin, fontSize: 20)])]
+    var top = pages[0].boxes[0].frame.maxY + 4, chunk: [String] = []
+    // ponytail: measures the growing chunk once per line; fine for documents of a few hundred lines
+    for line in lines.dropFirst() {
+        if chunk.isEmpty && line.isEmpty { continue } // no blank line at the top of a page
+        if !chunk.isEmpty, box(chunk + [line], top: top, fontSize: 12).frame.maxY > size.height - margin {
+            pages[pages.count - 1].boxes.append(box(chunk, top: top, fontSize: 12))
+            pages.append(PageItems())
+            top = margin
+            chunk = line.isEmpty ? [] : [line]
+        } else {
+            chunk.append(line)
+        }
+    }
+    if !chunk.isEmpty { pages[pages.count - 1].boxes.append(box(chunk, top: top, fontSize: 12)) }
+    return pages
 }
 
 /// GoodNotes text boxes and connectors as this app's editable text boxes and arrows, in PDF points.

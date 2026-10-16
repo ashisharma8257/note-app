@@ -5,3 +5,6 @@ xcuserdata/
 build/
 .claude/settings.local.json
 goodnotes_backup/
+board/node_modules/
+# App Store Connect API keys
+*.p8
