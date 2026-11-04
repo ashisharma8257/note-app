@@ -185,9 +185,14 @@ final class Notebook: ObservableObject {
     // ponytail: doc.pdf and meta.json are two writes; a crash between them misaligns ink from that page on (ink files survive)
     /// A new page repeats the paper of the page before it (lined, grid, a GoodNotes template); after a page of a
     /// document, or at the start, it gets the notebook's paper.
-    func addPage(at i: Int) {
-        let above = i > 0 ? pdf.page(at: i - 1) : nil
-        let page = above.flatMap { Store.isPaper($0) ? $0.copy() as? PDFPage : nil } ?? Store.paperPage(for: folder) ?? Store.paperPage(paper)
+    func addPage(at i: Int, paper override: Paper? = nil) {
+        let page: PDFPage
+        if let override {
+            page = Store.paperPage(override)
+        } else {
+            let above = i > 0 ? pdf.page(at: i - 1) : nil
+            page = above.flatMap { Store.isPaper($0) ? $0.copy() as? PDFPage : nil } ?? Store.paperPage(for: folder) ?? Store.paperPage(paper)
+        }
         pages.insert(UUID(), at: i)
         pdf.insert(page, at: i)
         structureChanged = true

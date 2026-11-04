@@ -33,7 +33,16 @@ struct NotebookView: View {
                 Spacer()
                 ToolPicker(tools: tools)
                 Spacer()
-                barButton("doc.badge.plus", "Add Page") { nb.addPage(at: (nb.currentIndex ?? nb.pdf.pageCount - 1) + 1) }
+                Menu {
+                    Button("Same as Current") { nb.addPage(at: (nb.currentIndex ?? nb.pdf.pageCount - 1) + 1) }
+                    Divider()
+                    ForEach(Paper.allCases, id: \.self) { paper in
+                        Button(paper.rawValue.capitalized) { nb.addPage(at: (nb.currentIndex ?? nb.pdf.pageCount - 1) + 1, paper: paper) }
+                    }
+                } label: {
+                    Image(systemName: "doc.badge.plus").font(.system(size: 20)).frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Add Page")
                 barButton("square.and.arrow.up", "Export PDF") {
                     do { exportURL = try nb.exportPDF() } catch { exportError = error.localizedDescription }
                 }
