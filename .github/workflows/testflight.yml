@@ -17,6 +17,9 @@ jobs:
           git fetch --depth=1 origin "${GITHUB_SHA}"
           git checkout "${GITHUB_SHA}"
 
+      - name: Unlock keychain
+        run: security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" ~/Library/Keychains/login.keychain-db
+
       - name: Build and upload to TestFlight
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
