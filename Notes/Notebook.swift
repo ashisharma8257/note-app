@@ -2,7 +2,7 @@ import PDFKit
 import PencilKit
 import SwiftUI
 
-enum Paper: String, Codable, CaseIterable { case blank, lined, grid, dotted }
+enum Paper: String, Codable, CaseIterable { case blank, lined, grid, dotted, doc }
 
 /// A titled jump to a spot on a page.
 struct OutlineEntry: Codable, Identifiable, Hashable {
@@ -648,6 +648,9 @@ enum Store {
                         UIBezierPath(ovalIn: CGRect(x: x - 0.8, y: y - 0.8, width: 1.6, height: 1.6)).fill()
                     }
                 }
+            case .doc:
+                for y in stride(from: 72.0, to: rect.maxY - 24, by: 24) { line(CGPoint(x: 0, y: y), CGPoint(x: rect.maxX, y: y)) }
+                line(CGPoint(x: 72, y: 0), CGPoint(x: 72, y: rect.maxY)) // left margin
             }
             UIColor(white: 0.85, alpha: 1).setStroke()
             path.lineWidth = 0.5
